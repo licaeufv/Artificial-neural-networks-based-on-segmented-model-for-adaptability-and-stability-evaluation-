@@ -1,0 +1,692 @@
+# Função para instalar pacotes (package.check) ----------------------------
+
+package.check <- function(packages) {
+  for (x in packages) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+}
+###########################################################################################
+
+# Função para simular os dados (train.set) --------------------------------
+
+train.set <- function(desv_pad, beta0, n_training, gl, QMR, rep, I_ord) {
+  
+  #' @param desv_pad desvio padrão do experimento.
+  #' @param beta0 média do experimento em estudo.
+  #' @param n_training número de genótipos simulados.
+  #' @param gl graus de liberdade da análise conjunta.
+  #' @param QMR quadrado médio do resíduo da análise conjunta.
+  #' @param rep número de repetições.
+  #' @param I_ord índice ambiental ordenado.
+  
+  n_ambientes = length(I_ord)
+  I = I_ord - mean(I_ord)
+  simula <- function(n_ambientes, desv_pad, beta0, Ibeta1, n_training, I_ord)
+  {
+    y_obs <- matrix(0, nrow = n_training, ncol = n_ambientes, byrow = T)
+    for(i in 1:n_training)
+    { 
+      if (Ibeta1 == 1)
+      {
+        beta1 <- runif(1, 0, 0.89)
+      }
+      if (Ibeta1 == 2)
+      {   
+        beta1 <- runif(1, 0.90, 1.10)
+      }
+      if (Ibeta1 == 3)
+      {
+        beta1 <- runif(1, 1.11, 2)
+      }
+      erro <- rnorm(n = n_ambientes, mean = 0, sd = desv_pad)
+      y_obs[i,] <- beta0 + beta1 * I_ord + erro
+      dados <- y_obs
+    }
+    d_train <- rbind(dados, I_ord)
+    return(d_train = d_train)
+  }
+  
+  # Beta1 > 1 (testado); s2 = 0 (não testado)
+  
+  cont<-0
+  dados1<-matrix(0,n_training,(n_ambientes+1),byrow=T)
+  i<-1
+  repeat
+  {
+    z1<-simula(n_ambientes,desv_pad,beta0, 3, 1,I_ord)
+    c1<-cbind(1,z1)
+    reg<-lm(c1[1,-1]~I_ord)
+    b=reg$coefficients
+    beta1<-b[2]
+    t <- (beta1-1)/sqrt((QMR/rep)/sum(I^2))
+    t_tab = qt(0.975, gl ,lower.tail=T)
+    if((t > t_tab) & (sum(c1[1,-1]<0)==0)) 
+    {
+      dados1[i,]<-c1[1,]
+      cont<-cont+1
+      i<-i+1
+    }
+    if(cont==n_training)
+      break
+  }
+  
+  # Beta1 = 1 (testado); s2 = 0 (não testado)
+  cont<-0
+  dados2<-matrix(0,n_training,(n_ambientes+1),byrow=T)
+  i<-1
+  repeat
+  {
+    z1<-simula(n_ambientes,desv_pad,beta0,2,1,I_ord)
+    c1<-cbind(2,z1)
+    reg<-lm(c1[1,-1]~I_ord)
+    b=reg$coefficients
+    beta1<-b[2]
+    t<-(beta1-1)/sqrt((QMR/rep)/sum(I^2))
+    t_tab.1 = qt(0.025, gl ,lower.tail=T)
+    t_tab.2 = qt(0.975, gl ,lower.tail=T)
+    if((t > t_tab.1) & (t <t_tab.2) & (sum(c1[1,-1]<0)==0))
+    {
+      dados2[i,]<-c1[1,]
+      cont<-cont+1
+      i<-i+1
+    }
+    if(cont==n_training)
+      break
+  }
+  
+  # Beta1 < 1 (testado); s2 = 0 (não testado)
+  cont<-0
+  dados3<-matrix(0,n_training,(n_ambientes+1),byrow=T)
+  i<-1
+  repeat
+  {
+    z1<-simula(n_ambientes,desv_pad,beta0,1,1,I_ord)
+    c1<-cbind(3,z1)
+    reg<-lm(c1[1,-1]~I_ord) 
+    b=reg$coefficients
+    beta1<-b[2]
+    t<-(beta1-1)/sqrt((QMR/rep)/sum(I^2))
+    t_tab <- qt(0.025, gl,lower.tail = TRUE)
+    if((t < t_tab) & (sum(c1[1,-1]<0)==0)) 
+    {
+      dados3[i,]<-c1[1,]
+      cont<-cont+1
+      i<-i+1
+    }
+    if(cont==n_training)
+      break
+  }
+  
+  #Passar os dados para escala ln para obter a resposta a respeito da estabilidade
+  # (utilizando conceito proposto por Finlay e Wilkison)
+  c11<-cbind(c(rep(4,n_training)),log(dados1[,2:(n_ambientes+1)]))
+  c22<-cbind(c(rep(5,n_training)),log(dados2[,2:(n_ambientes+1)]))
+  c33<-cbind(c(rep(6,n_training)),log(dados3[,2:(n_ambientes+1)]))
+  
+  ####Conjunto de dados para treinamento e teste
+  grupos <- rbind(dados1,dados2,dados3,c11,c22,c33)
+  return(sim.data = grupos)
+}
+###########################################################################################
+
+# Função para treinamento da rede (train.net) -----------------------------
+
+train.net <- function(data, rang = 0.0002, decay = 0.0005, maxit = 5000,
+                       max_error = 0.01, neurons = seq(4,15), p_train = 0.8,
+                       max_nwts = 2000) {
+  
+  #' Parâmetros da função
+  #' @param data dados de treinamento e validação.
+  #' @param rang pesos iniciais: ver artigo.
+  #' @param decay taxa de decaimento.
+  #' @param maxit máximo de iterações do treinamento.
+  #' @param max_error erro máximo desejado.
+  #' @param neurons sequência de onde serão selecionados os neurônios da camada oculta.
+  #' @param p_train valor [0;1] que determina a quantidade dos dados utilizados para treinamento.
+  #' @param max_nwts número máximo permitido de pesos.
+  
+  data = as_tibble(data)
+  
+  len = max(as.numeric(levels(data$Groups[[1]])))
+  
+  n_grupos = dim(data)[1]/len
+  n_t = n_grupos*p_train
+  i <- 1
+  size <- matrix(NA,10000)
+  erro <- matrix(NA,10000) 
+  repeat
+  {
+    ad = 0
+    samp = c()
+    for (z in 1:len) {
+      set <- sample(1:n_grupos, n_t, replace = FALSE) + ad * n_grupos
+      ad = ad + 1
+      samp[(n_t*(z-1)+1):(n_t*(z))] = set
+    }
+    
+    ncam <- sample(neurons, 1, replace = TRUE)
+    size[i,1] <- ncam
+    rede <- nnet(Groups ~ .,
+                 data = data,
+                 subset = samp,
+                 size = ncam,
+                 rang = rang,
+                 decay = decay,
+                 maxit = maxit,
+                 trace = TRUE,
+                 MaxNWts = max_nwts) 
+    
+    # Tabela de confusão sai errada!
+    b <- table(as.numeric(data$Groups[-samp]),
+               predict(rede, data[,-1][-samp,], type = "class"))
+    
+    # Ordena a tabela de confusão.
+    c <- matrix(0, max(as.numeric(data$Groups)), max(as.numeric(data$Groups)))
+    
+    
+    for (k in 1:dim(b)[2]) { 
+      for (l in 1:dim(c)[2]) {
+        if (as.numeric(colnames(b))[k] == l) {
+          c[, l] = b[, k]
+        }
+      }
+    }
+    
+    
+    erro[i] = eb = 1-(sum(diag(c))/sum(c))
+    print(eb)
+    print(ncam)
+    print(c)
+    
+    if (i == 1) {
+      rede.menor.erro <- rede
+      menor.erro <- eb
+      matriz_c <- c
+      neu.util <- ncam
+    }
+    if (eb <= menor.erro) {
+      rede.menor.erro <- rede
+      menor.erro <- eb
+      matriz_c <- c
+      neu.util <- ncam
+    }
+    if (erro[i] < max_error)
+      break
+    i <- i+1
+  }
+  return(list(rede.menor.erro = rede.menor.erro, 
+              menor.erro = menor.erro, matriz_confusao = matriz_c,
+              neuronios.utilizados = neu.util, all_neurons = size, 
+              all_erros = erro, sampled_lines_train = samp))
+}
+###########################################################################################
+
+# Função para combinar os dados simulados (comb.sim) ----------------------
+
+comb.sim <- function (unfav.env, fav.env, write = TRUE, data.name = "all_data_sim") {
+
+  #' @param unfav.env dados simulados para os ambientes desfavoráveis.
+  #' @param fav.env dados simulados para os ambientes favoráveis.
+  #' @param write se verdadeiro, os dados serão escritos no diretório.
+  #' @param data.name nome em que os dados serão escritos no diretório.
+  
+  dados.desf <- unfav.env %>% as_tibble()
+  colnames(dados.desf) <- c("Groups", paste0(rep("V", 6), 1:6))
+  
+  
+  dados.fav.1 <- fav.env %>% as_tibble()
+  colnames(dados.fav.1) <- c("Groups", paste0(rep("V", 9), 7:15))
+  
+  
+  dados.fav.2 <- fav.env %>% as_tibble() %>%
+    mutate(
+      V1 = recode(V1, `1` = 2, `2` = 3, `3` = 1, `4` = 5, `5` = 6, `6` = 4)
+    ) %>%
+    arrange(V1)
+  colnames(dados.fav.2) <- c("Groups", paste0(rep("V", 9), 7:15))
+  
+  
+  dados.fav.3 <- fav.env %>% as_tibble() %>%
+    mutate(
+      V1 = recode(V1, `1` = 3, `2` = 1, `3` = 2, `4` = 6, `5` = 4, `6` = 5)
+    ) %>%
+    arrange(V1)
+  colnames(dados.fav.3) <- c("Groups", paste0(rep("V", 9), 7:15))
+  
+  
+  dados.1st.join <- cbind(dados.desf, dados.fav.1[,-1]) %>% as_tibble() %>%
+    mutate(
+      Groups = recode(Groups, `4` = 10, `5` = 11, `6` = 12)
+    )
+  
+  dados.2nd.join <- cbind(dados.desf, dados.fav.2[,-1]) %>% as_tibble() %>%
+    mutate(
+      Groups = recode(Groups, `1` = 4, `2` = 5, `3` = 6, `4` = 13, `5` = 14, `6` = 15)
+    )
+  
+  dados.3rd.join <- cbind(dados.desf, dados.fav.3[,-1]) %>% as_tibble() %>%
+    mutate(
+      Groups = recode(Groups, `1` = 7, `2` = 8, `3` = 9, `4` = 16, `5` = 17, `6` = 18)
+    )
+  
+  all_data_sim = rbind(dados.1st.join, dados.2nd.join, dados.3rd.join) %>%
+    arrange(Groups) %>%
+    mutate(
+      Groups = factor(Groups)
+    )
+  
+  if (write == TRUE) {
+    write_csv(all_data_sim, paste0(data.name,".csv"))
+  }
+ 
+  return(all_data_sim)
+}
+###########################################################################################
+
+# Função para a classificação (net.adaptability.analysis) -----------------
+
+net.adaptability.analysis <- function(data, trained.net) {
+  
+  #' @param data dados para classificar a adaptabilidade e estabilidade nas mesmas configurações   utilizadas para treinar a rede.
+  #' @trained.net rede treinada.
+  
+  ng <- nrow(data) # Número de genótipos
+  na <- ncol(data) # Número de ambientes
+  h <- as.matrix(data, ng, na, byrow=F)
+  Ambos <- round(rowMeans(h), 2)
+  ia <- colMeans(h) - mean(h)
+  Desfavorável <- round(rowMeans(h[, ia < 0]), 2)
+  Favorável <- round(rowMeans(h[, ia >= 0]), 2)
+  h_ln <- log(h)
+  hh <- data.frame(rbind(h, h_ln))
+  
+  ####Aplicação da rede treinada ao conjunto de dados reais
+  pred <- predict(trained.net, hh, type = "class")
+  
+  #Análise final dados reais#########################
+  c <- as.numeric(pred[1:ng])
+  d <- as.numeric(pred[(ng + 1):(2*ng)])
+  
+  Adaptabilidade <- NULL
+  Estabilidade <- NULL
+  
+  for(i in 1:ng)
+  {
+    
+    if(c[i]==1) Adaptabilidade[i] <- ("(>1 | >1) Exclusivo Amb. Favorável")
+    if(c[i]==2) Adaptabilidade[i] <- ("(=1 | =1) Geral")
+    if(c[i]==3) Adaptabilidade[i] <- ("(<1 | <1) Exclusivo Amb. Desfavorável")
+    
+    if(c[i]==4) Adaptabilidade[i] <- ("(>1 | <1) Não Recomendado")
+    if(c[i]==5) Adaptabilidade[i] <- ("(=1 | >1) Exclusivo Amb. Favorável")
+    if(c[i]==6) Adaptabilidade[i] <- ("(<1 | =1) Exclusivo Amb. Desfavorável")
+    
+    if(c[i]==7) Adaptabilidade[i] <- ("(>1 | =1) Não Recomendado")
+    if(c[i]==8) Adaptabilidade[i] <- ("(=1 | <1) Não Recomendado")
+    if(c[i]==9) Adaptabilidade[i] <- ("(<1 | >1) Ideal")
+    
+    
+    if (c[i] == d[i] - 9) {Estabilidade[i] = "Alta"} else {Estabilidade[i] = "Baixa"}
+    
+  }
+  medias <- data.frame(cbind(Desfavorável, Favorável, Ambos))
+  adap_estab <- data.frame(cbind(Gen = 1:ng, Adaptabilidade, Estabilidade))
+  result <- cbind(adap_estab, medias)
+  return(result)
+}
+###########################################################################################
+
+# Função para gerar a tabela (gt_table) -----------------------------------
+
+gt_table <- function(class_table) {
+  table_gt = class_table %>% 
+    as.data.frame() %>%
+    gt() %>%
+    tab_footnote(
+      footnote = "Valores maiores que a média da coluna destacados em vermelho.",
+      locations = cells_column_labels(
+        columns = 4:6
+      )
+    ) %>%
+    tab_footnote(
+      footnote = "Adaptaptabilidade baseada no método de Verma, Chahal & Murty (1978).",
+      locations = cells_column_labels(
+        columns = 2
+      )
+    ) %>%
+    tab_footnote(
+      footnote = "Estabilidade baseada no método de Finlay & Wilkson (1963).",
+      locations = cells_column_labels(
+        columns = 3
+      )
+    ) %>%
+    tab_spanner(
+      label = "Média dos Genótipos nos Ambientes",
+      columns = 4:6
+    ) %>%
+    summary_rows(
+      groups = NULL,
+      columns = 4:6,
+      fns = list(Média = "mean"),
+      use_seps = F) %>% 
+    gt_highlight_rows(
+      rows = which(class_table$Adaptabilidade == "(<1 | >1) Ideal" &
+                     class_table$Estabilidade == "Alta" &
+                     class_table$Ambos > mean(class_table$Ambos)),
+      font_weight = "bold") %>%
+    tab_style(
+      style = cell_text(weight = "bold", color = "#C42754"),
+      locations = cells_body(
+        columns = 4,
+        rows = Desfavorável >= mean(class_table$Desfavorável))
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold", color = "#C42754"),
+      locations = cells_body(
+        columns = 5,
+        rows = Favorável >= mean(class_table$Favorável))
+    ) %>% 
+    tab_style(
+      style = cell_text(weight = "bold", color = "#C42754"),
+      locations = cells_body(
+        columns = 6,
+        rows = Ambos >= mean(class_table$Ambos))
+    ) %>%
+    cols_align(
+      align = "center",
+      columns = c(1,3:6)
+    )
+  return(table_gt)
+}
+###########################################################################################
+
+# Função para gerar tabela (ft_table) -------------------------------------
+
+ft_table <- function(class_table) {
+  
+  set_flextable_defaults(
+    font.size = 10, theme_fun = theme_vanilla,
+    padding = 6,
+    background.color = "white",
+    border.color = 'black')
+  
+  dat_mean <- summarize(class_table, 
+                        across(Desfavorável:Ambos, ~ mean(.x, na.rm = TRUE))) %>% 
+    add_column(Gen = "Mean", .before = TRUE)
+  dat <- bind_rows(class_table, dat_mean)
+  
+  
+  ft <- flextable(dat, col_keys = colnames(class_table)) %>% 
+    colformat_double(digits = 2, j = colnames(class_table)) %>% 
+    bold(i = nrow_part(., part = "body"))  %>%
+    color(i = 1:dim(class_table)[1], j = 4:6,
+          color = function(x) ifelse(x > mean(x), "#C42754", "transparent")) %>%
+    bold(., ~ Desfavorável > mean(class_table$Desfavorável),
+         ~ Desfavorável, bold = TRUE) %>%
+    bold(., ~ Ambos > mean(class_table$Ambos),
+         ~ Ambos, bold = TRUE) %>%
+    bold(., ~ Favorável > mean(class_table$Favorável),
+         ~ Favorável, bold = TRUE)  %>%
+    footnote(i = 1, j = 2,
+             value = as_paragraph(
+               c("Adaptabilidade baseada no método de Verma, Chahal e Murty (1978)")
+             ),
+             ref_symbols = "1",
+             part = "header", inline = TRUE) %>%
+    footnote(i = 1, j = 3,
+             value = as_paragraph(
+               c("Estabilidade baseada no método de Finlay & Wilkson (1963)")
+             ),
+             ref_symbols = "2",
+             part = "header", inline = TRUE) %>%
+    footnote(i = 1, j = 4:6,
+             value = as_paragraph(
+               c("Valores maiores que a média da coluna em vermelho.")
+             ),
+             ref_symbols = "3",
+             part = "header", inline = TRUE) %>%
+    padding(j = 2, padding.right = 110, part = "header") %>%
+    add_header_row(values = c("", "Média dos Genótipos nos Ambientes"),
+                   colwidths = c(3, 3),
+                   top = T) %>%
+    theme_booktabs() %>%
+    align(j = c(3:6), 
+          align = "center", part = "all") %>%
+    bg(i = which(class_table$Adaptabilidade == "(<1 | >1) Ideal" &
+                   class_table$Estabilidade == "Alta" &
+                   class_table$Ambos > mean(class_table$Ambos)),
+       bg = "#FEF79C") %>%
+    bold(i = 1:2, bold = TRUE, part = "header") %>%
+    hline(., i = ~ before(Gen, "Mean"), 
+          border = fp_border_default(width = 2)) %>%
+    autofit()
+  return(table_ft = ft)
+  
+}
+###########################################################################################
+
+# Função para mostrar gráficos (show_graphic) -----------------------------
+
+show_graphic <- function(data, jump = 1, y_lab = "Produção", env_index = c(),
+                         x_lab = "Índice Ambiental", obs_name = "Genótipo",
+                         group_name = "Grupo", obs_column = 1,
+                         y_lim = c(2000,6000), y_break = 1000, first_lm_group = 10,
+                         lm_y_lim = c(7,9), lm_y_break = 0.5, sec = 3)
+  {
+  
+  #' @param data dados de entrada.
+  #' @param jump salto das observações.
+  #' @param y_lab texto do eixo Y.
+  #' @param x_lab texto do eixo X.
+  #' @param env_index índice ambiental. Se vazio, será calculado com os dados.
+  #' @param obs_name nome da observação. Exemplo: "Genótipo".
+  #' @param group_name grupo em que pertence a observação.
+  #' @param obs_column coluna do banco de dados que indica as observações: class = factor.
+  #' @param y_lim limites do eixo Y.
+  #' @param y_break salto de escala do eixo Y.
+  #' @param lm_y_lim limites do eixo Y logaritmizado.
+  #' @param lm_y_break salto de escala do eixo Y logaritimizado.
+  #' @param first_lm_group identifica o início dos grupos de genótipos com Y logaritmizados.
+  #' @param sec espera em segundos para mudança dos gráficos.
+  
+  g = c()
+  if (is.factor(data[,obs_column][[1]])) {
+    g <- as.matrix(data[,obs_column])
+    data <- as.matrix(data[,-obs_column]) 
+  } else {
+    data <- as.matrix(data) 
+  }
+  
+  if (length(env_index) != 0) {
+    env_index = env_index
+  } else {
+    env_index = colMeans(data) - mean(as.matrix(data))
+  }
+  
+  limites <- function(i) { # função para determinar os limites do eixo y
+    if (as.numeric(g[i]) < first_lm_group) {
+      ggplot2::scale_y_continuous(limits = y_lim,
+                                  breaks = seq(y_lim[1], y_lim[2], y_break))
+    } else {
+      ggplot2::scale_y_continuous(limits = lm_y_lim,
+                                  breaks = seq(lm_y_lim[1], lm_y_lim[2], lm_y_break))
+    }
+  }
+  
+  for (i in seq(1, dim(data)[1], jump)) {
+    
+    grafico = ggformula::gf_point(t(data[i,]) ~ env_index,
+                                  ylab = y_lab,
+                                  xlab = x_lab, alpha = 0.5) + 
+      ggplot2::ggtitle(paste(obs_name, i),
+                       subtitle = paste(group_name, g[i])) +
+      ggplot2::theme_bw() +
+      limites(i)
+    
+    print(grafico)
+    Sys.sleep(sec)
+    if (i == dim(data)[1] - jump + 1) break
+    
+  }
+}
+###########################################################################################
+
+# Função para organizar os dados reais (organize.real.data) ---------------
+
+organize.real.data <- function(data, groups = "Grupos", amb = "Ambiente", y = "Prod") {
+  
+  #' @param data dados reais para serem organizados.
+  #' @param groups nome da coluna que define os grupos (ex: genótipos)
+  #' @param amb nome da coluna que define os ambientes
+  #' @param y nome da colula que define a resposta a ser avaliada (ex: produção).
+  #' @return dados reais organizados e ordenados e índice ambiental ordenado.
+  
+
+  data <- data %>%
+    dplyr::select(c(all_of(groups), all_of(amb), all_of(y))) %>%
+    group_by(.data[[groups]], .data[[amb]]) %>%
+    summarise_all(mean) %>%
+    pivot_wider(names_from = .data[[amb]], values_from = .data[[y]]) %>%
+    ungroup() %>%
+    mutate_at(groups, as.factor)
+  
+  # Obtendo o Índice Ambiental
+  I_Amb <- colMeans(data[,-1]) - mean(as.matrix(data[,-1]))
+  ia <- sort(I_Amb)
+  
+  # Removendo a coluna de grupos e organizando as colunas pela ordem dos índices ambientais
+  data <- data[,-1][, order(I_Amb)]
+  
+  # Renomeando as colunas para entrada correta na função
+  data <- data %>%
+    rename(V = 1:15)
+  
+  return(list(real_data = data, environ_index = ia))
+  
+}
+###########################################################################################
+
+# Instalação ou carregamento dos pacotes ----------------------------------
+
+packages = c("nnet","tidyverse", "flextable","gt",
+             "gtExtras", "NeuralNetTools", "neuralnet")
+
+package.check(packages)
+###########################################################################################
+
+# Dados obtidos das análises no Genes -------------------------------------
+
+# Na ordem:
+# Análise conjunta,
+# Análise do ambiente desfavorário,
+# Análise do ambiente favorável.
+
+
+#média geral
+media_geral = 4074.7799004432524888888888889
+media_desf = 3665.1209 
+media_fav = 4347.8859 
+
+#graus de liberdade da análise conjunta
+gl_geral = 270
+gl_desfav = 108 # é igual 270 * (6/15)
+gl_fav = 162 # 270 * (9/15)
+
+#quadrado médio do resíduo da análise conjunta
+QMR = 46139.8283
+QMR_desfav = 50141.6473
+QMR_fav = 43471.949
+
+#Desv_pad
+dp = sqrt(QMR)
+dp_desfav = sqrt(QMR_desfav)
+dp_fav = sqrt(QMR_fav)
+
+# número de repetições
+r <- 3 # Número de repetições é o mesmo em todos os ambientes
+
+###########################################################################################
+
+# Organização dos dados reais para uso ------------------------------------
+
+real_data <- read.table("dados_originais.txt", header = TRUE)
+
+real_data <- organize.real.data(real_data)
+
+env_index <- real_data$environ_index # índices ambientais ordenados
+real_data <- real_data$real_data # dados reais organizados e ordenados pelos índices ambientais
+
+
+index_unfav =  env_index[env_index < 0] # índices ambientais menores que zero
+
+index_fav  = env_index[env_index >= 0] # índices ambientais maiores ou iguais a zero
+###########################################################################################
+
+# Simulação dos dados -----------------------------------------------------
+
+#Rodando a função para ambiente desfavorável
+unfav.env <- train.set(desv_pad = dp_desfav, beta0 = media_geral, n_training = 500,
+                       gl = gl_desfav, QMR = QMR_desfav, rep = r, I_ord = index_unfav)
+
+#Rodando a função para ambiente favorável
+fav.env <-  train.set(desv_pad = dp_fav, beta0 = media_geral, n_training = 500,
+                       gl = gl_fav, QMR = QMR_fav, rep = r, I_ord = index_fav)
+###########################################################################################
+
+# Combinação dos dados simulados ------------------------------------------
+
+all_data_sim <- comb.sim(unfav.env, fav.env, 
+                         write = TRUE, data.name = "all_data_sim")
+# Não se preocupar com a "Warning message". Aparece por causa do nome das colunas.
+
+# Salvando os dados
+# write.csv(all_data_sim, "all_data_sim.csv")
+
+# Lendo os dados
+
+# all_data <- read_csv("all_data_sim.csv",col_names = T)[,-1] %>%
+#  mutate(Groups = factor(Grupos),
+#         .before = "V1",
+#         .keep = "unused")
+
+###########################################################################################
+
+# Visualização dos genótipos simulados ------------------------------------
+
+show_graphic(all_data, jump = 100, y_lab = "Produção (Kg/ha)", env_index = env_index,
+             x_lab = "Índice Ambiental", obs_name = "Genótipo",
+             group_name = "Grupo", obs_column = 1,
+             y_lim = c(2000,6000), y_break = 1000, first_lm_group = 10,
+             lm_y_lim = c(7,9), lm_y_break = 0.5, sec = 3)
+###########################################################################################
+
+# Treinamento da rede -----------------------------------------------------
+
+trained.net <- train.net(all_data_sim, rang = 0.0002, decay = 0.0005, maxit = 5000,
+                      max_error = 0.01, neurons = seq(4,15), p_train = 0.8,
+                      max_nwts = 2000)
+
+trained_net <- trained.net$rede.menor.erro
+# Salva a rede de menor erro
+saveRDS(trained_net, file = "trained_net.rda")
+
+# Carrega a rede salva
+trained_net <- readRDS("trained_net.rda")
+
+# Plota a rede de menor erro
+plotnet(trained_net)
+###########################################################################################
+
+# Classificação dos genótipos reais ---------------------------------------
+
+class_table <- net.adaptability.analysis(real_data, trained.net = trained_net)
+###########################################################################################
+
+# Visualização da classificação dos genótipos reais -----------------------
+
+gt_table(class_table)
+ft_table(class_table)
+###########################################################################################
